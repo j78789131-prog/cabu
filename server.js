@@ -1,34 +1,24 @@
-const express=require("express");
-const http=require("http");
-const {Server}=require("socket.io");
-const crypto=require("crypto");
-const app=express(), server=http.createServer(app), io=new Server(server);
-app.use(express.static("public"));
-app.get("/health",(req,res)=>res.json({ok:true,service:"cabu"}));
-const rooms=new Map();
-const suits=["♠","♥","♦","♣"];
-function deck(){const d=[];for(const s of suits)for(let n=1;n<=13;n++)d.push({n,s,id:crypto.randomUUID()});return d.sort(()=>Math.random()-.5)}
-function points(c){if((c.n===13)&&(c.s==="♥"||c.s==="♦"))return -1;if(c.n===1)return 1;if(c.n>=11)return 10;return c.n}
-function name(c){return (c.n===1?"A":c.n===11?"J":c.n===12?"Q":c.n===13?"K":c.n)+c.s}
-function roomView(r,forId){return {code:r.code,players:r.players.map(p=>({id:p.id,name:p.name,online:p.online,score:p.score,cardCount:p.cards.length,me:p.id===forId})),phase:r.phase,turn:r.turn,discard:r.discard.at(-1)||null,deckCount:r.deck.length,round:r.round,notice:r.notice,caller:r.caller};}
-function emitRoom(r){for(const p of r.players)io.to(p.id).emit("state",{...roomView(r,p.id),myCards:p.id===r.turn||r.phase==="setup"?p.cards.map(c=>({id:c.id,name:name(c),points:points(c)})):p.cards.map(()=>null)});}
-function findPlayer(socket){for(const r of rooms.values()){const p=r.players.find(x=>x.id===socket.id);if(p)return [r,p]}}
-function sendError(s,msg){s.emit("errorMessage",msg)}
-function startRound(r){r.deck=deck();r.discard=[];r.players.forEach(p=>{p.cards=r.deck.splice(0,4);p.score=null});r.discard.push(r.deck.pop());r.phase="setup";r.turn=r.players[0].id;r.caller=null;r.notice="Peek at two of your four cards, then ready up.";emitRoom(r)}
-function startPlay(r){r.phase="play";r.notice="Round started. Draw a card or take the top discard.";emitRoom(r)}
-function finish(r){r.phase="finished";r.players.forEach(p=>p.score=p.cards.reduce((a,c)=>a+points(c),0));r.notice="Round over. Lowest score wins.";emitRoom(r)}
-io.on("connection",socket=>{
- socket.on("createRoom",({name:playerName})=>{const nameClean=String(playerName||"").trim().slice(0,18);if(!nameClean)return sendError(socket,"Enter a nickname.");let code;do{code=crypto.randomBytes(3).toString("hex").toUpperCase()}while(rooms.has(code));const r={code,players:[],deck:[],discard:[],phase:"lobby",turn:null,round:1,notice:"Waiting for players.",caller:null};rooms.set(code,r);r.players.push({id:socket.id,name:nameClean,cards:[],online:true,score:null,ready:false});socket.join(code);socket.emit("joined",{code});emitRoom(r)});
- socket.on("joinRoom",({code,name:playerName})=>{const r=rooms.get(String(code||"").trim().toUpperCase()),nm=String(playerName||"").trim().slice(0,18);if(!r||!nm)return sendError(socket,"Room not found or nickname missing.");if(r.players.length>=6)return sendError(socket,"This room is full (6 players).");if(r.phase!=="lobby")return sendError(socket,"This round has already started.");r.players.push({id:socket.id,name:nm,cards:[],online:true,score:null,ready:false});socket.join(r.code);socket.emit("joined",{code:r.code});r.notice=nm+" joined.";emitRoom(r)});
- socket.on("startGame",()=>{const found=findPlayer(socket);if(!found)return;const [r,p]=found;if(r.players[0].id!==p.id||r.players.length<2)return sendError(socket,"The host can start with at least two players.");startRound(r)});
- socket.on("ready",()=>{const f=findPlayer(socket);if(!f)return;const [r,p]=f;if(r.phase!=="setup")return;p.ready=true;if(r.players.every(x=>x.ready))startPlay(r);else{r.notice=p.name+" is ready. Waiting for everyone.";emitRoom(r)}});
- socket.on("action",({type,cardId,index})=>{const f=findPlayer(socket);if(!f)return;const [r,p]=f;if(r.phase!=="play"||r.turn!==p.id)return sendError(socket,"It's not your turn.");if(type==="draw"){if(p.pending)return sendError(socket,"Finish your current draw first.");p.pending=r.deck.pop();if(!p.pending){r.deck=r.discard.splice(0,r.discard.length-1).sort(()=>Math.random()-.5);p.pending=r.deck.pop()}p.pending=true;r.notice=p.name+" drew a card.";emitRoom(r);socket.emit("drawn",{card:name(p.pending),id:p.pending.id});return}
- if(type==="takeDiscard"){if(p.pending)return sendError(socket,"You already drew.");p.pending=r.discard.at(-1);r.discard.pop();p.pending=true;socket.emit("drawn",{card:name(p.pending),id:p.pending.id});emitRoom(r);return}
- if(type==="exchange"&&p.pending){const i=Number(index);if(!Number.isInteger(i)||i<0||i>3)return;const old=p.cards[i];p.cards[i]=p.pending;r.discard.push(old);p.pending=null;next(r,p);return}
- if(type==="discardDrawn"&&p.pending){r.discard.push(p.pending);p.pending=null;next(r,p);return}
- if(type==="cabu"){r.caller=p.id;r.notice=p.name+" called Cabu!";r.turn=r.players[(r.players.findIndex(x=>x.id===p.id)+1)%r.players.length].id;r.finalTurns=r.players.length-1;emitRoom(r);return}
- sendError(socket,"That move is not available.")});
- function next(r,p){const i=r.players.findIndex(x=>x.id===p.id);r.turn=r.players[(i+1)%r.players.length].id;if(r.caller){r.finalTurns--;if(r.finalTurns<=0){finish(r);return}}r.notice="Next turn.";emitRoom(r)}
- socket.on("disconnect",()=>{const f=findPlayer(socket);if(!f)return;const [r,p]=f;p.online=false;r.notice=p.name+" disconnected.";emitRoom(r);if(r.players.every(x=>!x.online))rooms.delete(r.code)});
-});
-const port=process.env.PORT||3000;server.listen(port,"0.0.0.0",()=>console.log("Cabu listening on "+port));
+const express=require("express"),http=require("http"),crypto=require("crypto");const {Server}=require("socket.io");const app=express(),server=http.createServer(app),io=new Server(server);app.use(express.static("public"));app.get("/health",(q,s)=>s.json({ok:true,service:"cabu"}));const rooms=new Map(),suits=["♠","♥","♦","♣"];
+function deck(){return suits.flatMap(s=>Array.from({length:13},(_,i)=>({n:i+1,s,id:crypto.randomUUID()}))).sort(()=>Math.random()-.5)}
+function points(c){return c.n===13&&["♥","♦"].includes(c.s)?-1:c.n===1?1:c.n>=11?10:c.n}
+function name(c){return(c.n===1?"A":c.n===11?"J":c.n===12?"Q":c.n===13?"K":c.n)+c.s}
+function view(r,id){return{code:r.code,players:r.players.map(p=>({id:p.id,name:p.name,online:p.online,score:p.score,cardCount:p.cards.length,me:p.id===id,ready:p.ready})),phase:r.phase,turn:r.turn,discard:r.discard.at(-1)||null,deckCount:r.deck.length,round:r.round,notice:r.notice,caller:r.caller}}
+function emit(r){for(const p of r.players)io.to(p.id).emit("state",{...view(r,p.id),myCards:p.cards.map(c=>({id:c.id,name:name(c),points:points(c)})),myPending:p.pendingCard?{id:p.pendingCard.id,name:name(p.pendingCard)}:null})}
+function locate(id){for(const r of rooms.values()){const p=r.players.find(x=>x.id===id);if(p)return[r,p]}}
+function error(s,m){s.emit("errorMessage",m)}
+function begin(r){r.deck=deck();r.discard=[];r.players.forEach(p=>{p.cards=r.deck.splice(0,4);p.score=null;p.ready=false;p.pendingCard=null});r.discard.push(r.deck.pop());r.phase="setup";r.turn=r.players[0].id;r.caller=null;r.notice="Peek at two of your four cards, then ready up.";emit(r)}
+function play(r){r.phase="play";r.notice="Round started. Draw a card or take the top discard.";emit(r)}
+function finish(r){r.phase="finished";r.players.forEach(p=>p.score=p.cards.reduce((sum,c)=>sum+points(c),0));r.notice="Round over. Lowest score wins.";emit(r)}
+io.on("connection",s=>{
+s.on("createRoom",({name:n})=>{n=String(n||"").trim().slice(0,18);if(!n)return error(s,"Enter a nickname.");let code;do{code=crypto.randomBytes(3).toString("hex").toUpperCase()}while(rooms.has(code));const r={code,players:[],deck:[],discard:[],phase:"lobby",turn:null,round:1,notice:"Waiting for players.",caller:null};rooms.set(code,r);r.players.push({id:s.id,name:n,cards:[],online:true,score:null,ready:false,pendingCard:null});s.join(code);s.emit("joined",{code});emit(r)});
+s.on("joinRoom",({code,name:n})=>{const r=rooms.get(String(code||"").trim().toUpperCase());n=String(n||"").trim().slice(0,18);if(!r||!n)return error(s,"Room not found or nickname missing.");if(r.players.length>=6)return error(s,"Room full (maximum 6 players).");if(r.phase!=="lobby")return error(s,"This round has already started.");r.players.push({id:s.id,name:n,cards:[],online:true,score:null,ready:false,pendingCard:null});s.join(r.code);s.emit("joined",{code:r.code});r.notice=n+" joined.";emit(r)});
+s.on("startGame",()=>{const f=locate(s.id);if(!f)return;const[r,p]=f;if(r.players[0].id!==p.id||r.players.length<2)return error(s,"The host can start with at least two players.");begin(r)});
+s.on("ready",()=>{const f=locate(s.id);if(!f)return;const[r,p]=f;if(r.phase!=="setup")return;p.ready=true;if(r.players.every(x=>x.ready))play(r);else{r.notice=p.name+" is ready. Waiting for everyone.";emit(r)}});
+s.on("action",({type,index})=>{const f=locate(s.id);if(!f)return;const[r,p]=f;if(r.phase!=="play"||r.turn!==p.id)return error(s,"It's not your turn.");
+if(type==="draw"||type==="takeDiscard"){if(p.pendingCard)return error(s,"Finish your current draw first.");if(type==="takeDiscard"){if(!r.discard.length)return error(s,"Discard pile is empty.");p.pendingCard=r.discard.pop()}else{if(!r.deck.length){if(r.discard.length<2)return error(s,"No cards left to draw.");const top=r.discard.pop();r.deck=r.discard.splice(0).sort(()=>Math.random()-.5);r.discard.push(top)}p.pendingCard=r.deck.pop()}r.notice=p.name+" drew a card.";emit(r);return}
+if(type==="exchange"&&p.pendingCard){index=Number(index);if(!Number.isInteger(index)||index<0||index>3)return error(s,"Choose one of your four cards.");r.discard.push(p.cards[index]);p.cards[index]=p.pendingCard;p.pendingCard=null;next(r,p);return}
+if(type==="discardDrawn"&&p.pendingCard){r.discard.push(p.pendingCard);p.pendingCard=null;next(r,p);return}
+if(type==="cabu"&&!p.pendingCard){r.caller=p.id;r.notice=p.name+" called Cabu!";r.finalTurns=r.players.length-1;r.turn=r.players[(r.players.findIndex(x=>x.id===p.id)+1)%r.players.length].id;emit(r);return}error(s,"That move is not available.")});
+function next(r,p){const i=r.players.findIndex(x=>x.id===p.id);r.turn=r.players[(i+1)%r.players.length].id;if(r.caller){r.finalTurns--;if(r.finalTurns<=0){finish(r);return}}r.notice="Next turn.";emit(r)}
+s.on("disconnect",()=>{const f=locate(s.id);if(!f)return;const[r,p]=f;p.online=false;r.notice=p.name+" disconnected.";emit(r);if(r.players.every(x=>!x.online))rooms.delete(r.code)});
+});server.listen(process.env.PORT||3000,"0.0.0.0",()=>console.log("Cabu server listening"));
